@@ -1,242 +1,167 @@
 import pandas as pd
 import numpy as np
-import warnings
-warnings.filterwarnings("ignore")
-
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-import xgboost as xgb
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import lightgbm as lgb
-from catboost import CatBoostRegressor
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
 
+print("="*70)
+print("🚀 INTER-CITY SERVICE DEMAND FORECASTING - LIGHTGBM SOLUTION")
+print("="*70)
 
-train = pd.read_csv("train.csv")
-test = pd.read_csv("test.csv")
-interactions = pd.read_csv("interactions.csv")
+print("\n📊 Loading datasets...")
+train_df = pd.read_csv('train.csv')
+test_df = pd.read_csv('test.csv')
 
-for df in [train, test, interactions]:
-    if "service_date" in df.columns:
-        df["service_date"] = pd.to_datetime(df["service_date"], format="%d-%m-%Y")
-    if "interaction_date" in df.columns:
-        df["interaction_date"] = pd.to_datetime(df["interaction_date"], format="%d-%m-%Y")
+print(f"✓ Train shape: {train_df.shape}")
+print(f"✓ Test shape: {test_df.shape}")
+print(f"\nTrain columns: {train_df.columns.tolist()}")
+print(f"Test columns: {test_df.columns.tolist()}")
 
+print("\n📅 Processing dates...")
+train_df['service_date'] = pd.to_datetime(train_df['service_date'], format='%d-%m-%Y')
+test_df['service_date'] = pd.to_datetime(test_df['service_date'], format='%d-%m-%Y')
 
-def add_time_features(df):
-    df["year"] = df["service_date"].dt.year
-    df["month"] = df["service_date"].dt.month
-    df["day"] = df["service_date"].dt.day
-    df["dayofweek"] = df["service_date"].dt.dayofweek
-    df["dayofyear"] = df["service_date"].dt.dayofyear
-    df["week"] = df["service_date"].dt.isocalendar().week
-    df["quarter"] = df["service_date"].dt.quarter
-    df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
-    df["is_month_start"] = df["service_date"].dt.is_month_start.astype(int)
-    df["is_month_end"] = df["service_date"].dt.is_month_end.astype(int)
-    df["is_quarter_start"] = df["service_date"].dt.is_quarter_start.astype(int)
-    df["is_quarter_end"] = df["service_date"].dt.is_quarter_end.astype(int)
+print(f"✓ Date range in train: {train_df['service_date'].min()} to {train_df['service_date'].max()}")
+print(f"✓ Date range in test: {test_df['service_date'].min()} to {test_df['service_date'].max()}")
+
+def create_advanced_features(df):
+    df = df.copy()
+
+    print("   🔧 Creating temporal features...")
+    df['year'] = df['service_date'].dt.year
+    df['month'] = df['service_date'].dt.month
+    df['day'] = df['service_date'].dt.day
+    df['dayofweek'] = df['service_date'].dt.dayofweek
+    df['dayofyear'] = df['service_date'].dt.dayofyear
+    df['quarter'] = df['service_date'].dt.quarter
+    df['weekofyear'] = df['service_date'].dt.isocalendar().week.astype(int)
+    df['days_in_month'] = df['service_date'].dt.days_in_month
+
+    df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
+    df['is_monday'] = (df['dayofweek'] == 0).astype(int)
+    df['is_friday'] = (df['dayofweek'] == 4).astype(int)
+    df['is_month_start'] = df['service_date'].dt.is_month_start.astype(int)
+    df['is_month_end'] = df['service_date'].dt.is_month_end.astype(int)
+    df['is_quarter_start'] = df['service_date'].dt.is_quarter_start.astype(int)
+    df['is_quarter_end'] = df['service_date'].dt.is_quarter_end.astype(int)
+    df['is_year_start'] = (df['month'] == 1).astype(int)
+    df['is_year_end'] = (df['month'] == 12).astype(int)
+
+    print("   🔧 Creating cyclical encodings...")
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['day_sin'] = np.sin(2 * np.pi * df['day'] / 31)
+    df['day_cos'] = np.cos(2 * np.pi * df['day'] / 31)
+    df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
+    df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
+    df['dayofyear_sin'] = np.sin(2 * np.pi * df['dayofyear'] / 365)
+    df['dayofyear_cos'] = np.cos(2 * np.pi * df['dayofyear'] / 365)
+    df['quarter_sin'] = np.sin(2 * np.pi * df['quarter'] / 4)
+    df['quarter_cos'] = np.cos(2 * np.pi * df['quarter'] / 4)
+
+    print("   🔧 Creating route features...")
+    df['route'] = df['origin_hub_id'].astype(str) + '_to_' + df['destination_hub_id'].astype(str)
+    df['is_same_hub'] = (df['origin_hub_id'] == df['destination_hub_id']).astype(int)
+
+    df['origin_frequency'] = df.groupby('origin_hub_id')['origin_hub_id'].transform('count')
+    df['destination_frequency'] = df.groupby('destination_hub_id')['destination_hub_id'].transform('count')
+    df['route_frequency'] = df.groupby('route')['route'].transform('count')
+
+    df['origin_hub_encoded'] = df['origin_hub_id'].astype('category').cat.codes
+    df['destination_hub_encoded'] = df['destination_hub_id'].astype('category').cat.codes
+    df['route_encoded'] = df['route'].astype('category').cat.codes
+
+    df['hub_sum'] = df['origin_hub_encoded'] + df['destination_hub_encoded']
+    df['hub_diff'] = df['origin_hub_encoded'] - df['destination_hub_encoded']
+    df['hub_product'] = df['origin_hub_encoded'] * df['destination_hub_encoded']
+
+    print("   🔧 Creating aggregated statistics...")
+    df['month_dayofweek'] = df['month'].astype(str) + '_' + df['dayofweek'].astype(str)
+    df['quarter_dayofweek'] = df['quarter'].astype(str) + '_' + df['dayofweek'].astype(str)
+    df['month_day'] = df['month'].astype(str) + '_' + df['day'].astype(str)
+
+    df['route_month'] = df['route'] + '_' + df['month'].astype(str)
+    df['route_dayofweek'] = df['route'] + '_' + df['dayofweek'].astype(str)
+    df['route_quarter'] = df['route'] + '_' + df['quarter'].astype(str)
+
+    df['origin_month'] = df['origin_hub_id'].astype(str) + '_' + df['month'].astype(str)
+    df['origin_dayofweek'] = df['origin_hub_id'].astype(str) + '_' + df['dayofweek'].astype(str)
+    df['dest_month'] = df['destination_hub_id'].astype(str) + '_' + df['month'].astype(str)
+    df['dest_dayofweek'] = df['destination_hub_id'].astype(str) + '_' + df['dayofweek'].astype(str)
+
+    categorical_cols = [
+        'month_dayofweek', 'quarter_dayofweek', 'month_day',
+        'route_month', 'route_dayofweek', 'route_quarter',
+        'origin_month', 'origin_dayofweek', 'dest_month', 'dest_dayofweek'
+    ]
+
+    for col in categorical_cols:
+        df[f'{col}_encoded'] = df[col].astype('category').cat.codes
+
     return df
 
+print("\n🔧 Creating features for training data...")
+train_features = create_advanced_features(train_df)
 
-def build_interaction_features(df, offset=15):
-    base = df[df["days_before_service"] == offset]
+print("\n🔧 Creating features for test data...")
+test_features = create_advanced_features(test_df)
 
-    agg = (
-        base.groupby(["service_date", "origin_hub_id", "destination_hub_id"])
-        .agg({
-            "cumulative_commitments": ["last", "mean"],
-            "cumulative_interest_signals": ["last", "mean"]
-        })
-        .reset_index()
-    )
+print("\n🎯 Creating target encoding features...")
 
-    agg.columns = [
-        "service_date", "origin_hub_id", "destination_hub_id",
-        "commit_15d", "commit_15d_mean",
-        "interest_15d", "interest_15d_mean"
+def add_target_encoding(train_df, test_df, target_col='final_service_units'):
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    encoding_cols = [
+        'route', 'origin_hub_id', 'destination_hub_id',
+        'month', 'dayofweek', 'quarter', 'weekofyear',
+        'route_month', 'route_dayofweek', 'origin_month', 'dest_month'
     ]
 
-    recent = df[
-        (df["days_before_service"] >= offset) &
-        (df["days_before_service"] <= offset + 7)
-    ]
+    for col in encoding_cols:
+        target_mean = train_df.groupby(col)[target_col].agg(['mean', 'std', 'count']).reset_index()
+        target_mean.columns = [col, f'{col}_target_mean', f'{col}_target_std', f'{col}_target_count']
 
-    trend = (
-        recent.groupby(["service_date", "origin_hub_id", "destination_hub_id"])
-        .agg({
-            "cumulative_commitments": ["min", "max", "std"],
-            "cumulative_interest_signals": ["min", "max", "std"]
-        })
-        .reset_index()
-    )
+        train_df = train_df.merge(target_mean, on=col, how='left')
+        test_df = test_df.merge(target_mean, on=col, how='left')
 
-    trend.columns = [
-        "service_date", "origin_hub_id", "destination_hub_id",
-        "commit_min", "commit_max", "commit_std",
-        "interest_min", "interest_max", "interest_std"
-    ]
+        train_df[f'{col}_target_mean'].fillna(train_df[target_col].mean(), inplace=True)
+        train_df[f'{col}_target_std'].fillna(0, inplace=True)
+        train_df[f'{col}_target_count'].fillna(0, inplace=True)
 
-    feats = agg.merge(trend, on=["service_date", "origin_hub_id", "destination_hub_id"], how="left")
+        test_df[f'{col}_target_mean'].fillna(train_df[target_col].mean(), inplace=True)
+        test_df[f'{col}_target_std'].fillna(0, inplace=True)
+        test_df[f'{col}_target_count'].fillna(0, inplace=True)
 
-    feats["commit_growth"] = (feats["commit_max"] - feats["commit_min"]) / (feats["commit_min"] + 1)
-    feats["interest_growth"] = (feats["interest_max"] - feats["interest_min"]) / (feats["interest_min"] + 1)
-    feats["commit_interest_ratio"] = feats["commit_15d"] / (feats["interest_15d"] + 1)
+    return train_df, test_df
 
-    return feats
+train_features, test_features = add_target_encoding(train_features, test_features)
 
+print("\n📦 Preparing training data...")
 
-def hub_route_features(df):
-    origin = df.groupby("origin_hub_id").agg({
-        "cumulative_commitments": ["mean", "std", "max"],
-        "cumulative_interest_signals": ["mean", "std", "max"]
-    }).reset_index()
+exclude_cols = [
+    'service_date', 'final_service_units', 'route',
+    'origin_hub_id', 'destination_hub_id',
+    'month_dayofweek', 'quarter_dayofweek', 'month_day',
+    'route_month', 'route_dayofweek', 'route_quarter',
+    'origin_month', 'origin_dayofweek', 'dest_month', 'dest_dayofweek'
+]
 
-    origin.columns = [
-        "origin_hub_id",
-        "origin_commit_mean", "origin_commit_std", "origin_commit_max",
-        "origin_interest_mean", "origin_interest_std", "origin_interest_max"
-    ]
+if 'service_key' in train_features.columns:
+    exclude_cols.append('service_key')
 
-    dest = df.groupby("destination_hub_id").agg({
-        "cumulative_commitments": ["mean", "std", "max"],
-        "cumulative_interest_signals": ["mean", "std", "max"]
-    }).reset_index()
+feature_cols = [col for col in train_features.columns if col not in exclude_cols]
 
-    dest.columns = [
-        "destination_hub_id",
-        "dest_commit_mean", "dest_commit_std", "dest_commit_max",
-        "dest_interest_mean", "dest_interest_std", "dest_interest_max"
-    ]
+X = train_features[feature_cols]
+y = train_features['final_service_units']
 
-    route = df.groupby(["origin_hub_id", "destination_hub_id"]).agg({
-        "cumulative_commitments": ["mean", "std", "max", "count"],
-        "cumulative_interest_signals": ["mean", "std", "max"]
-    }).reset_index()
-
-    route.columns = [
-        "origin_hub_id", "destination_hub_id",
-        "route_commit_mean", "route_commit_std", "route_commit_max",
-        "route_freq", "route_interest_mean", "route_interest_std", "route_interest_max"
-    ]
-
-    return origin, dest, route
-
-
-train = add_time_features(train)
-test = add_time_features(test)
-
-interaction_feats = build_interaction_features(interactions)
-origin_stats, dest_stats, route_stats = hub_route_features(interactions)
-
-
-def merge_features(df):
-    df = df.merge(interaction_feats, on=["service_date", "origin_hub_id", "destination_hub_id"], how="left")
-    df = df.merge(origin_stats, on="origin_hub_id", how="left")
-    df = df.merge(dest_stats, on="destination_hub_id", how="left")
-    df = df.merge(route_stats, on=["origin_hub_id", "destination_hub_id"], how="left")
-    return df
-
-
-train = merge_features(train)
-test = merge_features(test)
-
-cat_cols = ["origin_hub_id", "destination_hub_id"]
-encoders = {}
-
-for col in cat_cols:
-    le = LabelEncoder()
-    le.fit(pd.concat([train[col].astype(str), test[col].astype(str)]))
-    train[col + "_enc"] = le.transform(train[col].astype(str))
-    test[col + "_enc"] = le.transform(test[col].astype(str))
-    encoders[col] = le
-
-
-drop_cols = ["service_date", "final_service_units", "origin_hub_id", "destination_hub_id"]
-features = [c for c in train.columns if c not in drop_cols]
-
-X = train[features].fillna(0)
-y = train["final_service_units"]
-X_test = test[features].fillna(0)
-
-
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
-
-oof_xgb = np.zeros(len(X))
-oof_lgb = np.zeros(len(X))
-oof_cat = np.zeros(len(X))
-
-pred_xgb = np.zeros(len(X_test))
-pred_lgb = np.zeros(len(X_test))
-pred_cat = np.zeros(len(X_test))
-
-
-for tr_idx, val_idx in kf.split(X):
-    X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
-    y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
-
-    xgb_model = xgb.XGBRegressor(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        tree_method="hist"
-    )
-    xgb_model.fit(X_tr, y_tr)
-    oof_xgb[val_idx] = xgb_model.predict(X_val)
-    pred_xgb += xgb_model.predict(X_test) / 5
-
-    lgb_model = lgb.LGBMRegressor(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    lgb_model.fit(X_tr, y_tr)
-    oof_lgb[val_idx] = lgb_model.predict(X_val)
-    pred_lgb += lgb_model.predict(X_test) / 5
-
-    cat_model = CatBoostRegressor(
-        iterations=1000,
-        learning_rate=0.05,
-        depth=7,
-        random_state=42,
-        verbose=False
-    )
-    cat_model.fit(X_tr, y_tr)
-    oof_cat[val_idx] = cat_model.predict(X_val)
-    pred_cat += cat_model.predict(X_test) / 5
-
-
-best_mae = float("inf")
-best_w = None
-
-for w1 in np.arange(0.2, 0.5, 0.05):
-    for w2 in np.arange(0.2, 0.5, 0.05):
-        w3 = 1 - w1 - w2
-        if w3 <= 0:
-            continue
-        mae = mean_absolute_error(y, w1 * oof_xgb + w2 * oof_lgb + w3 * oof_cat)
-        if mae < best_mae:
-            best_mae = mae
-            best_w = (w1, w2, w3)
-
-
-final_pred = (
-    best_w[0] * pred_xgb +
-    best_w[1] * pred_lgb +
-    best_w[2] * pred_cat
-)
-
-final_pred = np.maximum(final_pred, 0)
-
-submission = pd.DataFrame({
-    "service_key": test["service_key"],
-    "final_service_units": final_pred
-})
-
-submission.to_csv("submission.csv", index=False)
+print(f"✓ Number of features: {len(feature_cols)}")
+print(f"✓ Training samples: {len(X)}")
+print(f"✓ Target statistics:")
+print(f"   Mean: {y.mean():.2f}")
+print(f"   Std: {y.std():.2f}")
+print(f"   Min: {y.min():.2f}")
+print(f"   Max: {y.max():.2f}")
